@@ -32,15 +32,16 @@ import textwrap
 import string
 import random
 
-__version__ = '0.2.3'
+__version__ = '0.3.0'
 
 def setup_argparser():
     parser = argparse.ArgumentParser(description='Merge all specified directories into a single target folder and dedup based on file contents (SHA256 hash)')
     subparsers = parser.add_subparsers()
     folders_parser = subparsers.add_parser('merge-sources')
-    folders_parser.add_argument('--folders', type=str, required=True, nargs='+', help='Paths to source folders to be recursively checked and merged')
+    folders_parser.add_argument('--folders', type=str, required=False, nargs='+', help='Paths to source folders to be recursively checked and merged')
     folders_parser.add_argument('--target', type=str, required=True, help='Target folder')
     folders_parser.add_argument('--exclude-extensions', type=str, required=False, nargs='+', help='File extensions to exclude from selection')
+    folders_parser.add_argument('--compare-only', type=str, required=False, nargs='+', help='Paths to source folders to be recursively checked, but never actually copied')
     setup_folders_parser(folders_parser)
     folders_parser.set_defaults(func=merge_sources)
 
@@ -117,52 +118,101 @@ def merge_sources(args):
          print('The target path {} does not exist'.format(normalized_target))
          sys.exit(1)
 
+
+    #we need to interate the compare-only folders first, because the purpose is to do as little work as possible
+    if args.compare_only is not None:
+        for source_folder_index, source_folder in enumerate(args.compare_only, start=0):
+            ftypes.clear()
+            print('Processing COMPARE-ONLY folder {}/{}  ({})  at {}             File SHA256 CPUtime'.format(source_folder_index+1, len(args.compare_only), source_folder, time.strftime('%Y-%m-%d %I:%M:%S%p')))
+            time_start = time.process_time()   #CPU time, not clock time
+            
+            #recursively scan this folder and get files
+            if not args.exclude_extensions:
+                args.exclude_extensions = []
+            unused1, files = run_fast_scandir(source_folder, args.exclude_extensions)   
+            print('{} files have been selected'.format(len(files)))
+            
+            #see how many of each file type we have (just for summary output - does not affect processing)
+            ftypes = count_extensions(files)
+            print_indented(pprint.pformat(ftypes, width=200, sort_dicts=True), args.human_readable)
+
+            #iterate files and calculate a hash of the contents of each file
+            for j, file in enumerate(files, start=1):
+                file_hash, time_hashing = calc_hash(file)
+                if args.debug:
+                    print_indented(" ".join([file, file_hash, str(time_hashing)]), args.human_readable)
+                    
+                
+                if file_hash not in d.keys():                   #we have not seen this file content before
+                    d[file_hash] = [file, source_folder_index, 0]
+                elif file_hash in collisions.keys():            #we have already had a collision with this file content
+                    cvalue = []
+                    cvalue =  [file, source_folder_index, 0]
+                    collisions[file_hash].append(cvalue)
+                else:                                           #this is the first collision with this file content
+                    cvalue = []
+                    cvalue = [file, source_folder_index, 0]
+                    collisions[file_hash] = [cvalue]
+                if j % 500 == 0:                       #500 is arbitrary batch size for progress reporting
+                    print('Completed hashing of {} files at {}'.format(j, time.strftime('%Y-%m-%d %I:%M:%S%p')))
+
+            time_elapsed = time.process_time() - time_start
+            print('Hash calculations took {} seconds of CPU (avg {} sec/file) for folder {}'.format(time_elapsed, (round(float(time_elapsed)/float(len(files)), 3)), source_folder))
+            print('Timestamp: {}'.format(time.strftime('%Y-%m-%d %I:%M:%S%p')))
+
+
+
     #iterate supplied source folder list and compile the list of unique files to act on
     #do this by hashing files and using the hashes as dictionary keys
-    for source_folder_index, source_folder in enumerate(args.folders, start=0):
-        ftypes.clear()
-        print('Processing folder {}/{}  ({})  at {}             File SHA256 CPUtime'.format(source_folder_index+1, len(args.folders), source_folder, time.strftime('%Y-%m-%d %I:%M:%S%p')))
-        time_start = time.process_time()   #CPU time, not clock time
-        
-        #recursively scan this folder and get files
-        if not args.exclude_extensions:
-             args.exclude_extensions = []
-        unused1, files = run_fast_scandir(source_folder, args.exclude_extensions)   
-        print('{} files have been selected'.format(len(files)))
-        
-        #see how many of each file type we have (just for summary output - does not affect processing)
-        ftypes = count_extensions(files)
-        print_indented(pprint.pformat(ftypes, width=200, sort_dicts=True), args.human_readable)
-
-        #iterate files and calculate a hash of the contents of each file
-        for j, file in enumerate(files, start=1):
-            file_hash, time_hashing = calc_hash(file)
-            if args.debug:
-                print_indented(" ".join([file, file_hash, str(time_hashing)]), args.human_readable)
-                
+    if args.folders is not None:
+        for source_folder_index, source_folder in enumerate(args.folders, start=0):
+            ftypes.clear()
+            print('Processing folder {}/{}  ({})  at {}             File SHA256 CPUtime'.format(source_folder_index+1, len(args.folders), source_folder, time.strftime('%Y-%m-%d %I:%M:%S%p')))
+            time_start = time.process_time()   #CPU time, not clock time
             
-            if file_hash not in d.keys():                   #we have not seen this file content before
-                d[file_hash] = [file, source_folder_index]
-            elif file_hash in collisions.keys():            #we have already had a collision with this file content
-                cvalue = []
-                cvalue =  [file, source_folder_index]
-                collisions[file_hash].append(cvalue)
-            else:                                           #this is the first collision with this file content
-                cvalue = []
-                cvalue = [file, source_folder_index]
-                collisions[file_hash] = [cvalue]
-            if j % 500 == 0:                       #500 is arbitrary batch size for progress reporting
-                 print('Completed hashing of {} files at {}'.format(j, time.strftime('%Y-%m-%d %I:%M:%S%p')))
+            #recursively scan this folder and get files
+            if not args.exclude_extensions:
+                args.exclude_extensions = []
+            unused1, files = run_fast_scandir(source_folder, args.exclude_extensions)   
+            print('{} files have been selected'.format(len(files)))
+            
+            #see how many of each file type we have (just for summary output - does not affect processing)
+            ftypes = count_extensions(files)
+            print_indented(pprint.pformat(ftypes, width=200, sort_dicts=True), args.human_readable)
 
-        time_elapsed = time.process_time() - time_start
-        print('Hash calculations took {} seconds of CPU (avg {} sec/file) for folder {}'.format(time_elapsed, (round(float(time_elapsed)/float(len(files)), 3)), source_folder))
-        print('Timestamp: {}'.format(time.strftime('%Y-%m-%d %I:%M:%S%p')))
+            #iterate files and calculate a hash of the contents of each file
+            for j, file in enumerate(files, start=1):
+                file_hash, time_hashing = calc_hash(file)
+                if args.debug:
+                    print_indented(" ".join([file, file_hash, str(time_hashing)]), args.human_readable)
+                    
+                
+                if file_hash not in d.keys():                   #we have not seen this file content before
+                    d[file_hash] = [file, source_folder_index, 1]
+                elif file_hash in collisions.keys():            #we have already had a collision with this file content
+                    cvalue = []
+                    cvalue =  [file, source_folder_index, 1]
+                    collisions[file_hash].append(cvalue)
+                else:                                           #this is the first collision with this file content
+                    cvalue = []
+                    cvalue = [file, source_folder_index, 1]
+                    collisions[file_hash] = [cvalue]
+                if j % 500 == 0:                       #500 is arbitrary batch size for progress reporting
+                    print('Completed hashing of {} files at {}'.format(j, time.strftime('%Y-%m-%d %I:%M:%S%p')))
+
+            time_elapsed = time.process_time() - time_start
+            print('Hash calculations took {} seconds of CPU (avg {} sec/file) for folder {}'.format(time_elapsed, (round(float(time_elapsed)/float(len(files)), 3)), source_folder))
+            print('Timestamp: {}'.format(time.strftime('%Y-%m-%d %I:%M:%S%p')))
 
     #iterate list of unique files and make copies to the target
     print('File copy operations beginning at {}             [Source File, Folder]   -->   Target'.format(time.strftime('%Y-%m-%d %I:%M:%S%p')))
     i = 0
     for source_hash,value in d.items():
+        #value[0-2] = [str]file_path, [int]source_folder_index, [bool]do_copy
         i += 1
+
+        if not value[2]:
+             continue
 
         source_file = os.path.normpath(value[0])
         source_relpath = os.path.relpath(source_file, start=os.path.normpath(args.folders[value[1]]))
@@ -196,10 +246,10 @@ def merge_sources(args):
         if args.debug:
             print_indented('{}   -->   {}'.format(value, target_file), args.human_readable)
 
-        #if we are in dry-run mode, do not actually copy the file (read-only operation!)
+        #if we are in dry-run mode, do not actually copy any files (read-only operation!)
         if args.dry_run:
-                print('Skipping file copy operation :  --dry-run selected')
-                break        #go on to next file
+                print('Skipping all file copy operations :  --dry-run selected')
+                break       
             
         if not os.path.isfile(target_file):
             # we can copy because there is no filename collision
