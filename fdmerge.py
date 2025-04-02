@@ -28,11 +28,12 @@ import time
 import hashlib
 import shutil
 import pprint
+import pickle
 import textwrap
 import string
 import random
 
-__version__ = '0.3.0'
+__version__ = '0.4.0'
 
 def setup_argparser():
     parser = argparse.ArgumentParser(description='Merge all specified directories into a single target folder and dedup based on file contents (SHA256 hash)')
@@ -51,6 +52,8 @@ def setup_argparser():
     parser.add_argument('--display-collisions', action='store_true',help='Include this switch to show hash collisions at the end of the run')
     parser.add_argument('--display-renames', action='store_true',help='Include this switch to show renamed files at the end of the run')
     parser.add_argument('--dry-run', action='store_true',help='Include this switch to do all processing but skip actually copying files')
+    parser.add_argument('--store-hashes', action='store_true',help='Include this switch to save the generated hashtable in a file at the root of each source directory specified with --folders or --compare-only')
+    parser.add_argument('--load-hashes', action='store_true',help='Include this switch to load previously generated hashtable from a file at the root of each source directory specified.  THIS WILL NOT account for changes to the filesystem since the hashes were saved!')
 
     return parser
 
@@ -107,6 +110,7 @@ def calc_hash(file):
 
 def merge_sources(args):
     ftypes = {}         #dictionary of file extensions (histogram) seen in a single source folder
+    s = {}              #dictionary of unique files seen in a single source folder
     d = {}              #dictionary of unique files seen across all source folders
     copies = {}         #dictionary of files which were successfully copied into the target folder
     collisions = {}     #dictionary of file content collisions
@@ -122,42 +126,61 @@ def merge_sources(args):
     #we need to interate the compare-only folders first, because the purpose is to do as little work as possible
     if args.compare_only is not None:
         for source_folder_index, source_folder in enumerate(args.compare_only, start=0):
+            files = {}
             ftypes.clear()
+            s.clear()
             print('Processing COMPARE-ONLY folder {}/{}  ({})  at {}             File SHA256 CPUtime'.format(source_folder_index+1, len(args.compare_only), source_folder, time.strftime('%Y-%m-%d %I:%M:%S%p')))
             time_start = time.process_time()   #CPU time, not clock time
             
-            #recursively scan this folder and get files
-            if not args.exclude_extensions:
-                args.exclude_extensions = []
-            unused1, files = run_fast_scandir(source_folder, args.exclude_extensions)   
-            print('{} files have been selected'.format(len(files)))
-            
-            #see how many of each file type we have (just for summary output - does not affect processing)
-            ftypes = count_extensions(files)
-            print_indented(pprint.pformat(ftypes, width=200, sort_dicts=True), args.human_readable)
+            statefile_path = os.path.join(source_folder,"fdmerge_state.pkl")
 
-            #iterate files and calculate a hash of the contents of each file
-            for j, file in enumerate(files, start=1):
-                file_hash, time_hashing = calc_hash(file)
-                if args.debug:
-                    print_indented(" ".join([file, file_hash, str(time_hashing)]), args.human_readable)
-                    
+            if args.load_hashes and os.path.isfile(statefile_path): #test and find whether this source has saved hashes                
+                with open(statefile_path, 'rb') as statefile:
+                    s = pickle.load(statefile)
+                    for x in s.values(): #since we are in --folders, we want all loaded files to be considered for copying
+                         x[1] = source_folder_index
+                         x[2] = 0
+
+            else: #we do not want to load state, or it is not available
+                #recursively scan this folder and get files
+                if not args.exclude_extensions:
+                    args.exclude_extensions = []
+                unused1, files = run_fast_scandir(source_folder, args.exclude_extensions)   
+                print('{} files have been selected'.format(len(files)))
                 
-                if file_hash not in d.keys():                   #we have not seen this file content before
-                    d[file_hash] = [file, source_folder_index, 0]
-                elif file_hash in collisions.keys():            #we have already had a collision with this file content
-                    cvalue = []
-                    cvalue =  [file, source_folder_index, 0]
-                    collisions[file_hash].append(cvalue)
-                else:                                           #this is the first collision with this file content
-                    cvalue = []
-                    cvalue = [file, source_folder_index, 0]
-                    collisions[file_hash] = [cvalue]
-                if j % 500 == 0:                       #500 is arbitrary batch size for progress reporting
-                    print('Completed hashing of {} files at {}'.format(j, time.strftime('%Y-%m-%d %I:%M:%S%p')))
+                #see how many of each file type we have (just for summary output - does not affect processing)
+                ftypes = count_extensions(files)
+                print_indented(pprint.pformat(ftypes, width=200, sort_dicts=True), args.human_readable)
+
+                #iterate files and calculate a hash of the contents of each file
+                for j, file in enumerate(files, start=1):
+                    file_hash, time_hashing = calc_hash(file)
+                    if args.debug:
+                        print_indented(" ".join([file, file_hash, str(time_hashing)]), args.human_readable)
+                        
+                    
+                    if file_hash not in d.keys() and file_hash not in s.keys():                   #we have not seen this file content before
+                        s[file_hash] = [file, source_folder_index, 0]
+                    elif file_hash in collisions.keys():            #we have already had a collision with this file content
+                        cvalue = []
+                        cvalue =  [file, source_folder_index, 0]
+                        collisions[file_hash].append(cvalue)
+                    else:                                           #this is the first collision with this file content
+                        cvalue = []
+                        cvalue = [file, source_folder_index, 0]
+                        collisions[file_hash] = [cvalue]
+                    if j % 500 == 0:                       #500 is arbitrary batch size for progress reporting
+                        print('Completed hashing of {} files at {}'.format(j, time.strftime('%Y-%m-%d %I:%M:%S%p')))
+
+
+            if args.store_hashes:
+                with open(statefile_path, 'wb') as statefile:
+                    pickle.dump(s, statefile)
+            
+            d.update(s)
 
             time_elapsed = time.process_time() - time_start
-            print('Hash calculations took {} seconds of CPU (avg {} sec/file) for folder {}'.format(time_elapsed, (round(float(time_elapsed)/float(len(files)), 3)), source_folder))
+            print('Hash calculations took {} seconds of CPU (avg {} sec/file) for folder {}'.format(time_elapsed, (round(float(time_elapsed)/float(len(files)+1), 3)), source_folder)) #FIXME: add 1 to avoid possible divide-by-zero
             print('Timestamp: {}'.format(time.strftime('%Y-%m-%d %I:%M:%S%p')))
 
 
@@ -166,42 +189,59 @@ def merge_sources(args):
     #do this by hashing files and using the hashes as dictionary keys
     if args.folders is not None:
         for source_folder_index, source_folder in enumerate(args.folders, start=0):
+            files = {}
             ftypes.clear()
+            s.clear()
             print('Processing folder {}/{}  ({})  at {}             File SHA256 CPUtime'.format(source_folder_index+1, len(args.folders), source_folder, time.strftime('%Y-%m-%d %I:%M:%S%p')))
             time_start = time.process_time()   #CPU time, not clock time
-            
-            #recursively scan this folder and get files
-            if not args.exclude_extensions:
-                args.exclude_extensions = []
-            unused1, files = run_fast_scandir(source_folder, args.exclude_extensions)   
-            print('{} files have been selected'.format(len(files)))
-            
-            #see how many of each file type we have (just for summary output - does not affect processing)
-            ftypes = count_extensions(files)
-            print_indented(pprint.pformat(ftypes, width=200, sort_dicts=True), args.human_readable)
 
-            #iterate files and calculate a hash of the contents of each file
-            for j, file in enumerate(files, start=1):
-                file_hash, time_hashing = calc_hash(file)
-                if args.debug:
-                    print_indented(" ".join([file, file_hash, str(time_hashing)]), args.human_readable)
-                    
+            statefile_path = os.path.join(source_folder,"fdmerge_state.pkl")
+
+            if args.load_hashes and os.path.isfile(statefile_path): #test and find whether this source has saved hashes                
+                with open(statefile_path, 'rb') as statefile:
+                    s = pickle.load(statefile)
+                    for x in s.values(): #since we are in --folders, we want all loaded files to be considered for copying
+                         x[2] = 1
+
+            else: #we do not want to load state, or it is not available
+                #recursively scan this folder and get files
+                if not args.exclude_extensions:
+                    args.exclude_extensions = []
+                unused1, files = run_fast_scandir(source_folder, args.exclude_extensions)   
+                print('{} files have been selected'.format(len(files)))
                 
-                if file_hash not in d.keys():                   #we have not seen this file content before
-                    d[file_hash] = [file, source_folder_index, 1]
-                elif file_hash in collisions.keys():            #we have already had a collision with this file content
-                    cvalue = []
-                    cvalue =  [file, source_folder_index, 1]
-                    collisions[file_hash].append(cvalue)
-                else:                                           #this is the first collision with this file content
-                    cvalue = []
-                    cvalue = [file, source_folder_index, 1]
-                    collisions[file_hash] = [cvalue]
-                if j % 500 == 0:                       #500 is arbitrary batch size for progress reporting
-                    print('Completed hashing of {} files at {}'.format(j, time.strftime('%Y-%m-%d %I:%M:%S%p')))
+                #see how many of each file type we have (just for summary output - does not affect processing)
+                ftypes = count_extensions(files)
+                print_indented(pprint.pformat(ftypes, width=200, sort_dicts=True), args.human_readable)
+
+                #iterate files and calculate a hash of the contents of each file
+                for j, file in enumerate(files, start=1):
+                    file_hash, time_hashing = calc_hash(file)
+                    if args.debug:
+                        print_indented(" ".join([file, file_hash, str(time_hashing)]), args.human_readable)
+                        
+                    
+                    if file_hash not in d.keys() and file_hash not in s.keys():                   #we have not seen this file content before
+                        s[file_hash] = [file, source_folder_index, 1]
+                    elif file_hash in collisions.keys():            #we have already had a collision with this file content
+                        cvalue = []
+                        cvalue =  [file, source_folder_index, 1]
+                        collisions[file_hash].append(cvalue)
+                    else:                                           #this is the first collision with this file content
+                        cvalue = []
+                        cvalue = [file, source_folder_index, 1]
+                        collisions[file_hash] = [cvalue]
+                    if j % 500 == 0:                       #500 is arbitrary batch size for progress reporting
+                        print('Completed hashing of {} files at {}'.format(j, time.strftime('%Y-%m-%d %I:%M:%S%p')))
+
+            if args.store_hashes:
+                with open(statefile_path, 'wb') as statefile:
+                    pickle.dump(s, statefile)
+            
+            d.update(s)
 
             time_elapsed = time.process_time() - time_start
-            print('Hash calculations took {} seconds of CPU (avg {} sec/file) for folder {}'.format(time_elapsed, (round(float(time_elapsed)/float(len(files)), 3)), source_folder))
+            print('Hash calculations took {} seconds of CPU (avg {} sec/file) for folder {}'.format(time_elapsed, (round(float(time_elapsed)/float(len(files)+1), 3)), source_folder)) #FIXME: add 1 to avoid possible divide-by-zero
             print('Timestamp: {}'.format(time.strftime('%Y-%m-%d %I:%M:%S%p')))
 
     #iterate list of unique files and make copies to the target
