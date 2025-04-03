@@ -305,7 +305,7 @@ def merge_sources(args):
                  sys.exit(3)
 
         if i % 500 == 0: 
-            print('Completed copying of {} files at {}'.format(i, time.strftime('%Y-%m-%d %I:%M:%S%p')))
+            print('Completed copying of {} files at {}'.format(i, time.strftime('%Y-%m-%d %I:%M:%S%p'))) #FIXME: this is not correct when some sources are --compare-only
     
     print('Completed file copy operations at {}'.format(time.strftime('%Y-%m-%d %I:%M:%S%p')))
         
